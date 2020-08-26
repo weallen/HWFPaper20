@@ -1,0 +1,352 @@
+---
+title: "How We Feel Analysis: How is Behavior Affected by Testing?"
+author: "Andy Shi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+Our goal is to see how receiving a SARS-CoV-2 test changes one's
+behavior. We will focus on the time course of the behavior two weeks
+before and two weeks after receiving a test and compare how this differs
+for those tested as SARS-CoV-2(+) or SARS-CoV-2(-) and those predicted
+to be SARS-CoV-2(+) or SARS-CoV-2(-).
+
+# Setup and Data Munging
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(dplyr)
+library(ggplot2)
+library(broom)
+library(knitr)
+library(purrr)
+library(data.table)
+library(tidyr)
+```
+
+First, we define helper functions to recode the data and to collapse the
+data to a per-user summary.
+
+```{r recode}
+recode_df_helper <- function(df, varname, true_val, false_val) {
+  varname_new <- paste0(varname, "_NEW")
+  df[get(varname) == true_val, (varname_new) := 1L]
+  df[get(varname) == false_val, (varname_new) := 0L]
+}
+
+default_tf <- c("True", "False")
+recode_lst <- list(
+  cancelled_medical_appointment = c("yes", "no"),
+  combined_stayed_home = default_tf,
+  combined_left_for_work = default_tf,
+  combined_left_for_other = default_tf,
+  protective_measures_face_mask = default_tf,
+  protective_measures_other_face_covering = default_tf,
+  protective_measures_social_distancing = default_tf)
+
+recode_df <- function(df, recode_lst) {
+  for (i in seq_along(recode_lst)) {
+    behav_var <- names(recode_lst)[i]
+    true_val <- recode_lst[[behav_var]][1]
+    false_val <- recode_lst[[behav_var]][2]
+    recode_df_helper(df, behav_var, true_val, false_val)
+  }
+  df[, `:=` (
+      mask_wearing = pmax(protective_measures_face_mask_NEW,
+                          protective_measures_other_face_covering_NEW,
+                          na.rm = TRUE),
+      days_since_test_numeric = as.double(days_since_test,
+                                          units = "days"))]
+}
+
+```
+
+We then collapse across session_ids by days since test, tested/predicted
+status, and positive/negative status. For most of the variables, we take
+the mean: the proportion of check-ins on that day where a behavior was
+practiced. For the estimated number of people in contact, we take the
+median.
+
+```{r timecourse_collapse}
+timecourse_collapse <- function(df) {
+  timecourse1 <- df[,
+      lapply(.SD, mean, na.rm = TRUE),
+      by = .(days_since_test, tested_predicted_indicator, positive),
+      .SDcols = c("cancelled_medical_appointment_NEW",
+                  "combined_stayed_home_NEW",
+                  "combined_left_for_work_NEW",
+                  "combined_left_for_other_NEW",
+                  "protective_measures_social_distancing_NEW",
+                  "mask_wearing")]
+
+  timecourse2 <- df[,
+    .(nobs = .N,
+      estimate_people_contact =
+        median(estimate_people_contact, na.rm = TRUE)),
+    by = .(days_since_test, tested_predicted_indicator, positive)]
+
+  timecourse_final <-
+    merge(timecourse1, timecourse2,
+          by = c("days_since_test", "tested_predicted_indicator",
+                "positive"))
+  return(timecourse_final)
+}
+```
+
+Below, we munge the tested vs. untested individuals.
+
+
+```{r munge_test_untested}
+df_tested <- readRDS("df_tested.rds")
+df_untested <- readRDS("df_untested.rds")
+
+df_test_untest <- rbind(df_tested, df_untested, fill = TRUE)
+rm(df_untested)
+recode_df(df_test_untest, recode_lst)
+timecourse_test_untest <- timecourse_collapse(df_test_untest)
+rm(df_test_untest)
+```
+
+Below, we munge the tested vs. predicted individuals. Some individuals
+who were tested were also predicted, so we remove those from the
+analysis.
+
+```{r munge_test_pred}
+df_predicted <- readRDS("df_predicted.rds")
+df_tested_session_ids <- df_tested[, .(session_id)]
+# remove people who were tested
+df_predicted_filtered <- df_predicted[!df_tested, ]
+rm(df_predicted)
+
+df_test_pred <- rbind(df_tested, df_predicted_filtered, fill = TRUE)
+rm(df_predicted_filtered, df_tested)
+recode_df(df_test_pred, recode_lst)
+timecourse_test_pred <- timecourse_collapse(df_test_pred)
+rm(df_test_pred)
+```
+
+We then do some more recoding of the variables and also make a long
+version of the data.
+
+```{r timecourse_recode}
+timecourse_test_untest[is.na(positive), positive := 3]
+timecourse_test_untest[, `:=`
+  (positive_fct = factor(positive, levels = c(0, 1, 3),
+                         labels = c(" Negative", " Positive", "")),
+   tested_pred_fct = factor(tested_predicted_indicator))]
+timecourse_test_untest[,
+  test_pred_res := interaction(tested_pred_fct, positive_fct,
+                               sep = "", lex.order = TRUE, drop = TRUE)]
+
+timecourse_test_pred[, `:=`
+  (positive_fct = factor(positive, levels = c(0, 1),
+                         labels = c(" Negative", " Positive")),
+   tested_pred_fct = factor(tested_predicted_indicator))]
+timecourse_test_pred[,
+  test_pred_res := interaction(tested_pred_fct, positive_fct,
+                               sep = "", lex.order = TRUE, drop = TRUE)]
+
+vars_touse <- c("cancelled_medical_appointment_NEW",
+                "combined_stayed_home_NEW",
+                "combined_left_for_work_NEW",
+                "combined_left_for_other_NEW",
+                "protective_measures_social_distancing_NEW",
+                "mask_wearing",
+                "estimate_people_contact")
+vars_touse_pretty <- c("Canceled Medical Appt",
+                       "Stayed Home",
+                       "Left for Work",
+                       "Left for Other",
+                       "Social Distanced",
+                       "Wore Mask",
+                       "estimate_people_contact")
+timecourse_long_test_untested <- timecourse_test_untest %>%
+  select(-positive, -positive_fct, -tested_pred_fct,
+         -tested_predicted_indicator) %>%
+  pivot_longer(-c(days_since_test, nobs,
+                  test_pred_res),
+               names_to = "behavior_var",
+               values_to = "mean_users") %>%
+  mutate(behavior_fct =
+         factor(behavior_var, levels = vars_touse,
+                labels = vars_touse_pretty))
+
+timecourse_long_test_pred <- timecourse_test_pred %>%
+  select(-positive, -positive_fct, -tested_pred_fct,
+         -tested_predicted_indicator) %>%
+  pivot_longer(-c(days_since_test, nobs,
+                  test_pred_res),
+               names_to = "behavior_var",
+               values_to = "mean_users") %>%
+  mutate(behavior_fct =
+         factor(behavior_var, levels = vars_touse,
+                labels = vars_touse_pretty))
+```
+
+# Plots
+
+We first define the colors, line type, and shapes we want to use, and
+then plot the behavior time course for the variables we considered.
+
+```{r styles}
+neg_color <- "#79b5d9"
+pos_color <- "#f16347"
+color_vals1 <- c("Untested" = "#000000",
+                 "Tested Negative" = neg_color,
+                 "Tested Positive" = pos_color)
+lty_vals1 <- c("Untested" = "dashed",
+               "Tested Negative" = "solid",
+               "Tested Positive" = "solid")
+shape_vals1 <- c("Untested" = 17,
+                 "Tested Negative" = 20,
+                 "Tested Positive" = 20)
+
+color_vals2 <- c("Predicted Negative" = neg_color,
+                 "Predicted Positive" = pos_color,
+                 "Tested Negative" = neg_color,
+                 "Tested Positive" = pos_color)
+lty_vals2 <- c("Predicted Negative" = "dashed",
+               "Predicted Positive" = "dashed",
+               "Tested Negative" = "solid",
+               "Tested Positive" = "solid")
+shape_vals2  <- c("Predicted Negative" = 17,
+                 "Predicted Positive" = 17,
+                 "Tested Negative" = 20,
+                 "Tested Positive" = 20)
+```
+
+## Behavior Timecourse Plots
+
+```{r behavior_timecourse_plt}
+
+behavior_timecourse_test_untested <- timecourse_long_test_untested %>%
+  filter(behavior_var != "estimate_people_contact") %>%
+  ggplot(aes(x = days_since_test, y = mean_users,
+             color = test_pred_res, linetype = test_pred_res)) +
+  geom_line() +
+  xlab("Days since test") +
+  ylab("Prop. of Users Engaging") +
+  facet_wrap(vars(behavior_fct)) +
+  scale_color_manual(name = "Key", values = color_vals1) +
+  scale_linetype_manual(name = "Key", values = lty_vals1) +
+  geom_vline(xintercept = 0, lty = 2, color = "black", lwd = 1) +
+  theme_bw() +
+  theme(text = element_text(size = 15),
+        legend.position = "bottom",
+        panel.spacing = unit(2, "lines")) +
+  ggtitle("Change in Behavior After Testing")
+ggsave("figures/behavior_timecourse_test_untested.pdf",
+       behavior_timecourse_test_untested, width = 9, height = 6)
+
+behavior_timecourse_test_pred <- timecourse_long_test_pred %>%
+  filter(behavior_var != "estimate_people_contact") %>%
+  ggplot(aes(x = days_since_test, y = mean_users,
+             color = test_pred_res, linetype = test_pred_res)) +
+  geom_line() +
+  xlab("Days since test") +
+  ylab("Prop. of Users Engaging") +
+  facet_wrap(vars(behavior_fct)) +
+  scale_color_manual(name = "Key", values = color_vals2) +
+  scale_linetype_manual(name = "Key", values = lty_vals2) +
+  geom_vline(xintercept = 0, lty = 2, color = "black", lwd = 1) +
+  theme_bw() +
+  theme(text = element_text(size = 15),
+        legend.position = "bottom",
+        panel.spacing = unit(2, "lines")) +
+  ggtitle("Change in Behavior After Testing")
+ggsave("figures/behavior_timecourse_test_pred.pdf",
+       behavior_timecourse_test_pred, width = 9, height = 6)
+```
+
+## Estimated Number of Contacts
+
+For the estimated number of contacts, we plot the data on a log10 scale
+(technically log10(1 + x)). We fit a loess curve to the points to smooth
+out the trend.
+
+```{r est_contact_plt}
+est_contact_logscale_test_untest <- timecourse_test_untest %>%
+  ggplot(aes(x = days_since_test,
+             y = log10(1 + estimate_people_contact),
+             color = test_pred_res, linetype = test_pred_res,
+             shape = test_pred_res)) +
+  geom_jitter(alpha = 0.5, width = 0.2, height = 0) +
+  geom_smooth(method = "loess") +
+  geom_vline(xintercept = 0, lty = 2, color = "black", lwd = 2) +
+  xlab("Days since test") + ylab("log10(1 + Med. # of people contacted)") +
+  scale_color_manual(name = "Key", values = color_vals1) +
+  scale_linetype_manual(name = "Key", values = lty_vals1) +
+  scale_shape_manual(name = "Key", values = shape_vals1) +
+  theme_bw() +
+  theme(text = element_text(size = 15)) +
+  ggtitle("Median Number of People Contacted Before/After Test")
+ggsave("figures/est_contact_logscale_test_untest.pdf",
+       est_contact_logscale_test_untest, width = 8, height = 6)
+
+est_contact_logscale_test_pred <- timecourse_test_pred %>%
+  ggplot(aes(x = days_since_test,
+             y = log10(1 + estimate_people_contact),
+             color = test_pred_res, linetype = test_pred_res,
+             shape = test_pred_res)) +
+  geom_jitter(alpha = 0.5, width = 0.2, height = 0) +
+  geom_smooth(method = "loess") +
+  geom_vline(xintercept = 0, lty = 2, color = "black", lwd = 2) +
+  xlab("Days since test") + ylab("log10(1 + Med. # of people contacted)") +
+  scale_color_manual(name = "Key", values = color_vals2) +
+  scale_linetype_manual(name = "Key", values = lty_vals2) +
+  scale_shape_manual(name = "Key", values = shape_vals2) +
+  theme_bw() +
+  theme(text = element_text(size = 15)) +
+  ggtitle("Median Number of People Contacted Before/After Test")
+ggsave("figures/est_contact_logscale_test_pred.pdf",
+       est_contact_logscale_test_pred, width = 8, height = 6)
+```
+
+## Appendix: Number of observations
+
+Finally, we show the number of observations in each category during the
+window of time considered.
+
+```{r nobs_plt}
+nobs_test_untest <- timecourse_test_untest %>%
+  ggplot(aes(x = days_since_test, y = nobs,
+             color = test_pred_res, linetype = test_pred_res)) +
+  geom_line() +
+  scale_color_manual(name = "Key", values = color_vals1) +
+  scale_linetype_manual(name = "Key", values = lty_vals1) +
+  xlab("Days since test") + ylab("Number of responses") +
+  scale_y_log10() +
+  geom_vline(xintercept = 0, lty = 2, color = "black", lwd = 1) +
+  theme_bw() +
+  theme(text = element_text(size = 15)) +
+  ggtitle("Number of responses over time")
+ggsave("figures/nobs_test_untest.pdf", nobs_test_untest,
+       width = 8, height = 6)
+
+nobs_test_pred <- timecourse_test_pred %>%
+  ggplot(aes(x = days_since_test, y = nobs,
+             color = test_pred_res, linetype = test_pred_res)) +
+  geom_line() +
+  scale_color_manual(name = "Key", values = color_vals2) +
+  scale_linetype_manual(name = "Key", values = lty_vals2) +
+  xlab("Days since test") + ylab("Number of responses") +
+  scale_y_log10() +
+  geom_vline(xintercept = 0, lty = 2, color = "black", lwd = 1) +
+  theme_bw() +
+  theme(text = element_text(size = 15)) +
+  ggtitle("Number of responses over time")
+ggsave("figures/nobs_test_pred.pdf", nobs_test_pred,
+       width = 8, height = 6)
+```
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
